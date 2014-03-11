@@ -5,28 +5,29 @@
 package wssf
 
 import (
+	"errors"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const (
-	// Time allowed to write a message to the peer.
-	writeWait = 10 * time.Second
-
-	// Time allowed to read the next pong message from the peer.
-	pongWait = 60 * time.Second
-
-	// Send pings to peer with this period. Must be less than pongWait.
-	pingPeriod = (pongWait * 9) / 10
-
-	// Maximum message size allowed from peer.
-	maxMessageSize = 512
-)
-
 type wattingMsg struct {
 	mt   int
 	data []byte
+}
+
+type timerNotify struct {
+	fn func()
+}
+
+type receiveNotify struct {
+	mt   int
+	data []byte
+	err  error
+}
+
+type sendErrNotify struct {
+	err error
 }
 
 // Connection is an middleman between the websocket Connection and the hub.
@@ -39,17 +40,23 @@ type Connection struct {
 
 	handler ConnectionHandler
 
-	timer chan func()
+	notifyChan chan interface{}
 }
 
-//send message to peer
+//notify this connection something
+//concurrent safe
+func (c *Connection) Notify(v interface{}) {
+	c.notifyChan <- v
+}
+
+//send message to peer, mt: wssf.TextMessage or wssf.BinaryMessage
 //concurrent safe
 func (c *Connection) Send(mt int, data []byte) {
 	m := wattingMsg{mt, data}
 	c.send <- m
 }
 
-//sometime need a timer function called from same goroutine with OnReceived
+//add a timer function, called from same goroutine with Handler.OnReceived()
 //to stop timer, use returned channel
 //for example: rc := c.AddTimer(d, fn)
 //rc <- true
@@ -58,7 +65,7 @@ func (c *Connection) AddTimer(d time.Duration, fn func()) chan bool {
 	go func() {
 		select {
 		case <-time.After(d):
-			c.timer <- fn
+			c.Notify(timerNotify{fn})
 		case <-stop: //cancel timer
 		}
 	}()
@@ -68,38 +75,58 @@ func (c *Connection) AddTimer(d time.Duration, fn func()) chan bool {
 // readPump pumps messages from the websocket Connection to the hub.
 func (c *Connection) readPump() {
 	defer func() {
-		//notify disconnected
 		c.handler.OnDisconnected(c)
 		h.unregister <- c
 		c.ws.Close()
 	}()
-	c.ws.SetReadLimit(maxMessageSize)
-	c.ws.SetReadDeadline(time.Now().Add(pongWait))
-	c.ws.SetPongHandler(func(string) error { c.ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+	c.ws.SetReadLimit(Config.MaxMessageSize)
+	c.ws.SetReadDeadline(time.Now().Add(Config.PongWait))
+	c.ws.SetPongHandler(func(string) error { c.ws.SetReadDeadline(time.Now().Add(Config.PongWait)); return nil })
+
+	go func() {
+		for {
+			mt, data, err := c.ws.ReadMessage()
+			c.Notify(receiveNotify{mt, data, err})
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+L:
 	for {
-		select {
-		case fn := <-c.timer:
-			fn()
-		}
-		mt, data, err := c.ws.ReadMessage()
-		if err != nil {
-			break
-		}
-		if !c.handler.OnReceived(c, mt, data) {
-			break
+		v := <-c.notifyChan
+		switch r := v.(type) {
+		case timerNotify:
+			r.fn()
+		case receiveNotify:
+			if r.err != nil {
+				c.handler.OnError(r.err)
+				break L
+			}
+			if !c.handler.OnReceived(c, r.mt, r.data) {
+				break L
+			}
+		case sendErrNotify:
+			if r.err != nil {
+				c.handler.OnError(r.err)
+				break L
+			}
+		default:
+			c.handler.OnNotify(v)
 		}
 	}
 }
 
 // write writes a message with the given message type and payload.
 func (c *Connection) write(mt int, payload []byte) error {
-	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
+	c.ws.SetWriteDeadline(time.Now().Add(Config.WriteWait))
 	return c.ws.WriteMessage(mt, payload)
 }
 
 // writePump pumps messages from the hub to the websocket Connection.
 func (c *Connection) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(Config.PingPeriod)
 	defer func() {
 		ticker.Stop()
 		c.ws.Close()
@@ -109,13 +136,16 @@ func (c *Connection) writePump() {
 		case message, ok := <-c.send:
 			if !ok {
 				c.write(websocket.CloseMessage, []byte{})
+				c.Notify(sendErrNotify{errors.New("receive msg from send channel failed")})
 				return
 			}
 			if err := c.write(message.mt, message.data); err != nil {
+				c.Notify(sendErrNotify{err})
 				return
 			}
 		case <-ticker.C:
 			if err := c.write(websocket.PingMessage, []byte{}); err != nil {
+				c.Notify(sendErrNotify{err})
 				return
 			}
 		}
