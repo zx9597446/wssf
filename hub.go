@@ -20,6 +20,10 @@ type hub struct {
 	unregister chan *Connection
 }
 
+func init() {
+	go h.run()
+}
+
 var h = hub{
 	broadcast:   make(chan wattingMsg),
 	register:    make(chan *Connection),
